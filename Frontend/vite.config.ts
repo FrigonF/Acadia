@@ -94,8 +94,8 @@ function figmaSiteConfiguration(config: FigmaSiteConfiguration): Plugin {
     return html.replace(`<!-- ${slotName} -->`, content)
   }
 
-  const title = config.title ?? "Figma Make App"
-  const description = config.description ?? ""
+  const title = config.title ?? "ACADIA | Academic Identity Platform"
+  const description = config.description ?? "APAAR ID-Based Student Data Management and Verification Platform for AICTE-Approved Institutions (SIH26263)."
   // Imported HTML keeps its own favicon; new Makes default to the Make product icon.
   const favicon = config.icons?.icon ?? "/favicon.svg"
   const socialImage = config.openGraph?.image ?? ""

@@ -1,1 +1,7 @@
-{}
+{
+  "title": "ACADIA | Academic Identity Platform",
+  "description": "APAAR ID-Based Student Data Management and Verification Platform for AICTE-Approved Institutions (SIH26263).",
+  "icons": {
+    "icon": "/favicon.svg"
+  }
+}
