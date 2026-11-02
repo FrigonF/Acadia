@@ -24,14 +24,14 @@ class IntakeVerificationEngine:
         inst = db.query(Institution).filter(Institution.id == institution_id).first()
         inst_name = inst.name if inst else "Unknown Institution"
 
-        # Query enrollment counts grouped by seat_category
+        # Query active enrollment counts grouped by seat_category (excludes REJECTED and DEACTIVATED)
         enrollment_counts = db.query(
             Student.seat_category, func.count(Student.id)
         ).filter(
             Student.institution_id == institution_id,
             func.lower(Student.programme) == programme.lower(),
             Student.academic_year == academic_year,
-            Student.record_status != "REJECTED"
+            Student.record_status.notin_(["REJECTED", "DEACTIVATED"])
         ).group_by(Student.seat_category).all()
 
         cat_counts = {cat.upper() if cat else "GENERAL": count for cat, count in enrollment_counts}

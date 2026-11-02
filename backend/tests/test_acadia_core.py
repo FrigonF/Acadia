@@ -137,9 +137,11 @@ def test_e2e_workflow():
     assert "anomalies" in anomaly_res.json()
 
     # Step 6: Upload a CSV Batch
+    import uuid
+    unique_apaar = f"99{str(uuid.uuid4().int)[:10]}"
     csv_content = (
         "student_name,apaar_id,programme,academic_year,seat_category\n"
-        "E2E Test Student,778899008044,B.Tech Computer Science and Engineering,2025-2026,GENERAL\n"
+        f"E2E Test Student,{unique_apaar},B.Tech Computer Science and Engineering,2025-2026,GENERAL\n"
         "E2E Invalid Student,999,B.Tech Computer Science and Engineering,2025-2026,GENERAL\n"
     )
     inst_res = client.get("/api/v1/institutions", headers=headers)

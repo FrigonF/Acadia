@@ -131,16 +131,16 @@ export function StudentModal({
 
             <div>
               <label className="block text-xs uppercase font-mono tracking-wider text-gray-400 mb-1">
-                APAAR ID (12 Digits) *
+                {mode === "edit" ? "Update APAAR ID (Optional, 12 Digits)" : "APAAR ID (12 Digits) *"}
               </label>
               <input
                 type="text"
                 value={apaarId}
                 onChange={(e) => setApaarId(e.target.value)}
                 maxLength={12}
-                required
+                required={mode === "add"}
                 disabled={isView}
-                placeholder={isView ? student?.apaar_masked : "e.g. 112233445566"}
+                placeholder={mode === "edit" ? `Current: ${student?.apaar_masked || "Masked"} (leave blank to keep)` : isView ? student?.apaar_masked : "e.g. 112233445566"}
                 className="w-full bg-[#1a2130] border border-gray-700 rounded-lg px-3 py-2 text-sm text-white font-mono focus:outline-none focus:border-emerald-500 disabled:opacity-60"
               />
             </div>

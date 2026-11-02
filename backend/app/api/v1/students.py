@@ -5,12 +5,15 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from backend.app.core.database import get_db
 from backend.app.core.permissions import get_current_user, require_roles, UserRole
-from backend.app.core.security import compute_hmac_fingerprint, mask_apaar_id
-from backend.app.models import Student, Institution, RecordVersion, VerificationCredential
+from backend.app.core.security import compute_hmac_fingerprint, mask_apaar_id, encrypt_identifier
+from backend.app.models import Student, Institution, RecordVersion, VerificationCredential, ValidationIssue, UploadBatch
 from backend.app.schemas import StudentResponse, StudentCreate, StudentUpdate, StudentDeactivateRequest
 from backend.app.services.reporting.audit_service import log_audit_event
 from backend.app.services.record_integrity.canonical import create_canonical_json, compute_record_fingerprint
 from backend.app.services.record_integrity.signer import signature_service
+from backend.app.services.validation.validator import validation_engine
+from backend.app.services.duplicate_detection.detector import duplicate_engine
+from backend.app.services.intake_monitoring.intake_service import intake_engine
 
 router = APIRouter(prefix="/students", tags=["Students"])
 
@@ -23,7 +26,7 @@ def list_students(
     programme: Optional[str] = None,
     academic_year: Optional[str] = None,
     include_inactive: bool = False,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     query = db.query(Student)
@@ -48,7 +51,7 @@ def list_students(
 @router.get("/{id}", response_model=StudentResponse)
 def get_student(
     id: str,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     student = db.query(Student).filter(Student.id == id).first()
@@ -69,18 +72,73 @@ def create_student(
     if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id != payload.institution_id:
         raise HTTPException(status_code=403, detail="Cannot create record for another institution.")
 
-    # Format validation
+    inst = db.query(Institution).filter(Institution.id == payload.institution_id).first()
+    if not inst:
+        raise HTTPException(status_code=404, detail=f"Institution '{payload.institution_id}' not found.")
+
     apaar = payload.apaar_id.strip()
-    if not apaar.isdigit() or len(apaar) != 12:
-        raise HTTPException(status_code=400, detail="APAAR ID must be exactly 12 numeric digits.")
+
+    # 1. Run deterministic Validation Engine
+    raw_dict = {
+        "source_row": 1,
+        "apaar_id": apaar,
+        "name": payload.name.strip(),
+        "programme": payload.programme.strip(),
+        "academic_year": payload.academic_year.strip(),
+        "seat_category": (payload.seat_category or "GENERAL").strip().upper(),
+    }
+    validation_issues = validation_engine.validate_record(raw_dict, inst)
+    has_critical = any(issue.severity == "CRITICAL" for issue in validation_issues)
+
+    # 2. Run Duplicate Detection Engine (HMAC fingerprint)
+    fingerprint = compute_hmac_fingerprint(apaar)
+    existing_dups = db.query(Student).filter(
+        Student.apaar_fingerprint == fingerprint,
+        Student.record_status != "DEACTIVATED"
+    ).all()
+    is_dup = len(existing_dups) > 0
+    dup_type = None
+    if is_dup:
+        has_critical = True
+        is_same_inst = any(s.institution_id == inst.id for s in existing_dups)
+        dup_type = "WITHIN_INSTITUTION" if is_same_inst else "CROSS_INSTITUTION"
+
+    # 3. Check Approved Intake Capacity
+    intake_rep = intake_engine.verify_intake_for_programme(
+        db, institution_id=inst.id, programme=payload.programme.strip(), academic_year=payload.academic_year.strip()
+    )
+    has_intake_violation = len(intake_rep.get("alerts", [])) > 0
+
+    # Determine status
+    if has_critical or is_dup or has_intake_violation or validation_issues:
+        status_str = "FLAGGED"
+    else:
+        status_str = "PENDING_VALIDATION"
 
     masked = mask_apaar_id(apaar)
-    fingerprint = compute_hmac_fingerprint(apaar)
+    encrypted_apaar = encrypt_identifier(apaar)
+
+    # Ensure a default manual upload batch exists for manual intake tracking
+    manual_batch = db.query(UploadBatch).filter(
+        UploadBatch.institution_id == inst.id,
+        UploadBatch.original_filename == "manual_intake_registry"
+    ).first()
+    if not manual_batch:
+        manual_batch = UploadBatch(
+            institution_id=inst.id,
+            original_filename="manual_intake_registry",
+            total_records=0,
+            status="COMPLETED",
+            uploaded_by=current_user.id
+        )
+        db.add(manual_batch)
+        db.flush()
 
     student = Student(
+        batch_id=manual_batch.id,
         institution_id=payload.institution_id,
         name=payload.name.strip(),
-        apaar_id=apaar,
+        apaar_id=encrypted_apaar,
         apaar_masked=masked,
         apaar_fingerprint=fingerprint,
         programme=payload.programme.strip(),
@@ -88,16 +146,62 @@ def create_student(
         seat_category=(payload.seat_category or "GENERAL").strip().upper(),
         enrollment_number=payload.enrollment_number.strip() if payload.enrollment_number else None,
         enrollment_year=payload.enrollment_year,
-        record_status="VALIDATED"
+        record_status=status_str,
+        is_duplicate=is_dup,
+        duplicate_type=dup_type
     )
     db.add(student)
+    db.flush()
+
+    # Record validation issues in database
+    for issue in validation_issues:
+        db.add(ValidationIssue(
+            student_id=student.id,
+            batch_id=manual_batch.id,
+            rule_id=issue.rule_id,
+            issue_category=issue.category,
+            severity=issue.severity,
+            field=issue.field,
+            source_row=1,
+            explanation=issue.explanation,
+            recommended_correction=issue.recommended_correction
+        ))
+
+    if is_dup:
+        db.add(ValidationIssue(
+            student_id=student.id,
+            batch_id=manual_batch.id,
+            rule_id="RULE_DUPLICATE_APAAR",
+            issue_category="DUPLICATE",
+            severity="CRITICAL",
+            field="apaar_id",
+            source_row=1,
+            explanation=f"Duplicate enrollment detected ({dup_type}). APAAR fingerprint matches existing record.",
+            recommended_correction="Resolve duplicate enrollment with the reporting institution before approval."
+        ))
+
+    if has_intake_violation:
+        for alert in intake_rep.get("alerts", []):
+            db.add(ValidationIssue(
+                student_id=student.id,
+                batch_id=manual_batch.id,
+                rule_id="RULE_INTAKE_CAPACITY",
+                issue_category="INTAKE_LIMIT",
+                severity=alert.get("severity", "CRITICAL"),
+                field="seat_category",
+                source_row=1,
+                explanation=alert.get("explanation", "Programme intake capacity exceeded."),
+                recommended_correction="Adjust institutional intake or transfer student to approved quota."
+            ))
+
     db.commit()
     db.refresh(student)
 
+    # Privacy: raw APAAR never included in audit payloads
     log_audit_event(
         db, action="CREATE_STUDENT", target_type="STUDENT", target_id=student.id,
         actor_id=current_user.id, actor_email=current_user.email, actor_role=current_user.role,
-        new_state={"name": student.name, "apaar_masked": student.apaar_masked, "programme": student.programme}
+        new_state={"name": student.name, "apaar_masked": student.apaar_masked, "programme": student.programme, "status": student.record_status}
     )
     return student
 
@@ -105,7 +209,7 @@ def create_student(
 def update_student(
     id: str,
     payload: StudentUpdate,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     student = db.query(Student).filter(Student.id == id).first()
@@ -115,13 +219,10 @@ def update_student(
     if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id != student.institution_id:
         raise HTTPException(status_code=403, detail="Cannot edit records of another institution.")
 
-    if current_user.role == UserRole.AUTHORIZED_EXTERNAL_VERIFIER.value:
-        raise HTTPException(status_code=403, detail="External verifiers have read-only access.")
-
-    # Record previous state
+    # Record previous state (clean, masked)
     previous_state = {
         "name": student.name,
-        "apaar_id": student.apaar_id,
+        "apaar_masked": student.apaar_masked,
         "programme": student.programme,
         "academic_year": student.academic_year,
         "seat_category": student.seat_category,
@@ -134,12 +235,12 @@ def update_student(
         changed_fields["name"] = {"old": student.name, "new": payload.name.strip()}
         student.name = payload.name.strip()
 
-    if payload.apaar_id is not None and payload.apaar_id.strip() != student.apaar_id:
+    if payload.apaar_id is not None and payload.apaar_id.strip() != "":
         new_apaar = payload.apaar_id.strip()
         if not new_apaar.isdigit() or len(new_apaar) != 12:
             raise HTTPException(status_code=400, detail="Updated APAAR ID must be exactly 12 numeric digits.")
         changed_fields["apaar_id"] = {"old": student.apaar_masked, "new": mask_apaar_id(new_apaar)}
-        student.apaar_id = new_apaar
+        student.apaar_id = encrypt_identifier(new_apaar)
         student.apaar_masked = mask_apaar_id(new_apaar)
         student.apaar_fingerprint = compute_hmac_fingerprint(new_apaar)
 
@@ -162,72 +263,89 @@ def update_student(
     if not changed_fields:
         return student
 
-    # If student had an existing sealed version, create a new pending version
+    # Re-validate updated record
     inst = db.query(Institution).filter(Institution.id == student.institution_id).first()
-    latest_version = db.query(RecordVersion).filter(
-        RecordVersion.student_id == student.id
-    ).order_by(RecordVersion.version_number.desc()).first()
-
-    next_version_num = (latest_version.version_number + 1) if latest_version else 1
-    prev_fingerprint = latest_version.fingerprint if latest_version else None
-
-    # Construct canonical representation of new version
-    canonical_payload = {
-        "student_id": student.id,
+    check_dict = {
+        "source_row": 1,
+        "apaar_id": payload.apaar_id.strip() if (payload.apaar_id and payload.apaar_id.strip()) else "000000000000",
         "name": student.name,
-        "apaar_masked": student.apaar_masked,
-        "apaar_fingerprint": student.apaar_fingerprint,
-        "institution_id": student.institution_id,
-        "institution_name": inst.name if inst else "Unknown",
         "programme": student.programme,
         "academic_year": student.academic_year,
-        "seat_category": student.seat_category,
-        "enrollment_number": student.enrollment_number or "",
-        "version_number": next_version_num,
-        "previous_fingerprint": prev_fingerprint or "ROOT_GENESIS",
-        "update_reason": payload.reason
+        "seat_category": student.seat_category
     }
+    validation_issues = validation_engine.validate_record(check_dict, inst)
+    has_critical = any(issue.severity == "CRITICAL" for issue in validation_issues)
 
-    canonical_str = create_canonical_json(canonical_payload)
-    new_fingerprint = compute_record_fingerprint(canonical_str)
-    new_signature = signature_service.sign_fingerprint(new_fingerprint)
-    pub_key_pem = signature_service.get_public_key_pem()
-
-    # Create new record version
-    version_obj = RecordVersion(
-        student_id=student.id,
-        version_number=next_version_num,
-        canonical_payload=canonical_payload,
-        fingerprint=new_fingerprint,
-        previous_fingerprint=prev_fingerprint,
-        previous_version_id=latest_version.id if latest_version else None,
-        signature=new_signature,
-        public_key=pub_key_pem,
-        key_id=signature_service.key_id,
-        approved_by=current_user.id
-    )
-    db.add(version_obj)
-
-    # Invalidate / revoke old credentials if sealed
+    # Invalidate / supersede old active credentials immediately upon modification
     existing_creds = db.query(VerificationCredential).filter(
         VerificationCredential.student_id == student.id,
         VerificationCredential.status == "ACTIVE"
     ).all()
     for cred in existing_creds:
         cred.status = "SUPERSEDED"
-        cred.revocation_reason = f"Superseded by version {next_version_num}: {payload.reason}"
+        cred.revocation_reason = f"Superseded by update: {payload.reason}"
         cred.revoked_at = datetime.now(timezone.utc)
+
+    # Separation of duties:
+    # If the modifier is an authorized central verifier / platform admin, they may directly approve and seal.
+    # If modified by Institution Admin, the record transitions to PENDING_VALIDATION or FLAGGED and requires independent verification.
+    is_verifier = current_user.role in (UserRole.PLATFORM_ADMIN.value, UserRole.AICTE_VERIFIER.value)
+    
+    if is_verifier and not has_critical:
+        student.record_status = "APPROVED"
+        latest_version = db.query(RecordVersion).filter(
+            RecordVersion.student_id == student.id
+        ).order_by(RecordVersion.version_number.desc()).first()
+        next_version_num = (latest_version.version_number + 1) if latest_version else 1
+        prev_fingerprint = latest_version.fingerprint if latest_version else None
+
+        canonical_payload = {
+            "student_id": student.id,
+            "name": student.name,
+            "apaar_masked": student.apaar_masked,
+            "apaar_fingerprint": student.apaar_fingerprint,
+            "institution_id": student.institution_id,
+            "institution_name": inst.name if inst else "Unknown",
+            "programme": student.programme,
+            "academic_year": student.academic_year,
+            "seat_category": student.seat_category,
+            "enrollment_number": student.enrollment_number or "",
+            "version_number": next_version_num,
+            "previous_fingerprint": prev_fingerprint or "ROOT_GENESIS",
+            "update_reason": payload.reason
+        }
+        canonical_str = create_canonical_json(canonical_payload)
+        new_fingerprint = compute_record_fingerprint(canonical_str)
+        new_signature = signature_service.sign_fingerprint(new_fingerprint)
+        pub_key_pem = signature_service.get_public_key_pem()
+
+        version_obj = RecordVersion(
+            student_id=student.id,
+            version_number=next_version_num,
+            canonical_payload=canonical_payload,
+            fingerprint=new_fingerprint,
+            previous_fingerprint=prev_fingerprint,
+            previous_version_id=latest_version.id if latest_version else None,
+            signature=new_signature,
+            public_key=pub_key_pem,
+            key_id=signature_service.key_id,
+            approved_by=current_user.id
+        )
+        db.add(version_obj)
+    else:
+        # Proposed correction by Institution Admin requires independent verification
+        student.record_status = "FLAGGED" if has_critical else "PENDING_VALIDATION"
 
     db.commit()
     db.refresh(student)
 
-    # Record Audit Log
+    # Record Audit Log (Notice: raw APAAR is never logged)
     log_audit_event(
         db, action="UPDATE_STUDENT_RECORD", target_type="STUDENT", target_id=student.id,
         actor_id=current_user.id, actor_email=current_user.email, actor_role=current_user.role,
         previous_state=previous_state,
-        new_state={"version": next_version_num, "fingerprint": new_fingerprint, "changed_fields": changed_fields},
-        metadata={"reason": payload.reason}
+        new_state={"status": student.record_status, "changed_fields": changed_fields},
+        metadata={"reason": payload.reason, "requires_verifier_approval": not is_verifier}
     )
 
     return student
@@ -236,7 +354,7 @@ def update_student(
 def deactivate_student(
     id: str,
     payload: StudentDeactivateRequest,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     student = db.query(Student).filter(Student.id == id).first()
@@ -245,9 +363,6 @@ def deactivate_student(
 
     if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id != student.institution_id:
         raise HTTPException(status_code=403, detail="Cannot deactivate students of another institution.")
-
-    if current_user.role == UserRole.AUTHORIZED_EXTERNAL_VERIFIER.value:
-        raise HTTPException(status_code=403, detail="External verifiers cannot deactivate records.")
 
     prev_status = student.record_status
     student.record_status = "DEACTIVATED"

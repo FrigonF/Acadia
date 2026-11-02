@@ -6,9 +6,9 @@ services:
     container_name: acadia_postgres
     restart: always
     environment:
-      POSTGRES_USER: acadia
-      POSTGRES_PASSWORD: acadia_password
-      POSTGRES_DB: acadia_db
+      POSTGRES_USER: ${POSTGRES_USER:-acadia}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be provided}
+      POSTGRES_DB: ${POSTGRES_DB:-acadia_db}
     ports:
       - "5432:5432"
     volumes:
@@ -21,10 +21,14 @@ services:
     container_name: acadia_backend
     restart: always
     environment:
-      DATABASE_URL: postgresql://acadia:acadia_password@db:5432/acadia_db
-      SECRET_KEY: acadia_prod_secret_key_sih2026
-      HMAC_SECRET_KEY: acadia_hmac_secret_key_sih2026
-      ED25519_PRIVATE_KEY_HEX: 4a5c6d7e8f901234567890abcdef1234567890abcdef1234567890abcdef1234
+      ENV: ${ENV:-production}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be provided}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be provided}
+      HMAC_SECRET_KEY: ${HMAC_SECRET_KEY:?HMAC_SECRET_KEY must be provided}
+      FIELD_ENCRYPTION_KEY: ${FIELD_ENCRYPTION_KEY:?FIELD_ENCRYPTION_KEY must be provided}
+      ED25519_PRIVATE_KEY_HEX: ${ED25519_PRIVATE_KEY_HEX:?ED25519_PRIVATE_KEY_HEX must be provided}
+      KEY_ID: ${KEY_ID:-acadia-platform-v1}
+      TRUSTED_PUBLIC_KEYS: ${TRUSTED_PUBLIC_KEYS:-{}}
     ports:
       - "8000:8000"
     depends_on:

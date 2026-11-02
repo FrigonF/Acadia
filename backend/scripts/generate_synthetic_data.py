@@ -21,7 +21,9 @@ import io
 from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 from backend.app.core.database import SessionLocal, Base, engine
-from backend.app.core.security import get_password_hash, compute_hmac_fingerprint, mask_apaar_id
+import sys
+import argparse
+from backend.app.core.security import get_password_hash, compute_hmac_fingerprint, mask_apaar_id, encrypt_identifier
 from backend.app.core.permissions import UserRole
 from backend.app.models import (
     User, Institution, Student, ApprovedIntake, UploadBatch, ValidationIssue
@@ -94,18 +96,29 @@ SYNTHETIC_INSTITUTIONS = [
 FIRST_NAMES = ["Aarav", "Aditi", "Ananya", "Arjun", "Deepak", "Diya", "Ishan", "Kavya", "Manish", "Neha", "Pranav", "Pooja", "Rahul", "Rhea", "Rohan", "Sanya", "Siddharth", "Sneha", "Tanvi", "Varun", "Vikram", "Yash", "Lakshmi", "Rakesh", "Gaurav"]
 LAST_NAMES = ["Sharma", "Verma", "Gupta", "Patel", "Reddy", "Nair", "Rao", "Iyer", "Kumar", "Singh", "Das", "Joshi", "Bose", "Mehta", "Chopra", "Kulkarni", "Deshmukh", "Pillai", "Menon", "Bhat"]
 
-def generate_synthetic_data():
+def generate_synthetic_data(force_reset: bool = False):
     Base.metadata.create_all(bind=engine)
     db: Session = SessionLocal()
 
-    print("--- 1. Resetting previous demonstration tables ---")
-    db.query(ValidationIssue).delete()
-    db.query(Student).delete()
-    db.query(UploadBatch).delete()
-    db.query(ApprovedIntake).delete()
-    db.query(User).delete()
-    db.query(Institution).delete()
-    db.commit()
+    existing_students = db.query(Student).count()
+    if existing_students > 0 and not force_reset:
+        print(f"Database already populated ({existing_students} existing student records found).")
+        print("Skipping non-destructive seed to protect existing data and credentials.")
+        print("To perform an explicit reset, run: python -m backend.scripts.generate_synthetic_data --reset")
+        db.close()
+        return
+
+    if force_reset:
+        print("--- 1. EXPLICIT RESET REQUESTED: Purging existing demonstration tables ---")
+        db.query(ValidationIssue).delete()
+        db.query(Student).delete()
+        db.query(UploadBatch).delete()
+        db.query(ApprovedIntake).delete()
+        db.query(User).delete()
+        db.query(Institution).delete()
+        db.commit()
+    else:
+        print("--- 1. Initializing clean demonstration database ---")
 
     print("--- 2. Creating Synthetic Institutions ---")
     inst_objs = []
@@ -207,7 +220,7 @@ def generate_synthetic_data():
         s = Student(
             institution_id=inst_objs[0].id,
             name=f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}",
-            apaar_id=apaar,
+            apaar_id=encrypt_identifier(apaar),
             apaar_masked=mask_apaar_id(apaar) if apaar else "N/A",
             apaar_fingerprint=compute_hmac_fingerprint(apaar) if apaar else "UNASSIGNED",
             programme=prog,
@@ -231,7 +244,7 @@ def generate_synthetic_data():
         s = Student(
             institution_id=inst_objs[1].id,
             name=f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}",
-            apaar_id=apaar,
+            apaar_id=encrypt_identifier(apaar),
             apaar_masked=mask_apaar_id(apaar),
             apaar_fingerprint=compute_hmac_fingerprint(apaar),
             programme="B.Tech Computer Science and Engineering",
@@ -252,7 +265,7 @@ def generate_synthetic_data():
         s = Student(
             institution_id=inst_objs[2].id,
             name=f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}",
-            apaar_id=apaar,
+            apaar_id=encrypt_identifier(apaar),
             apaar_masked=mask_apaar_id(apaar),
             apaar_fingerprint=compute_hmac_fingerprint(apaar),
             programme="B.Tech Computer Science and Engineering" if i <= 50 else "B.Tech Data Science",
@@ -271,7 +284,7 @@ def generate_synthetic_data():
         s = Student(
             institution_id=inst_objs[3].id,
             name=f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}",
-            apaar_id=apaar,
+            apaar_id=encrypt_identifier(apaar),
             apaar_masked=mask_apaar_id(apaar),
             apaar_fingerprint=compute_hmac_fingerprint(apaar),
             programme="B.Tech Computer Science and Engineering" if i <= 45 else "B.Tech Mechanical Engineering",
@@ -288,7 +301,7 @@ def generate_synthetic_data():
         s = Student(
             institution_id=inst_objs[4].id,
             name=f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}",
-            apaar_id=apaar,
+            apaar_id=encrypt_identifier(apaar),
             apaar_masked=mask_apaar_id(apaar),
             apaar_fingerprint=compute_hmac_fingerprint(apaar),
             programme="B.Tech Artificial Intelligence & Machine Learning",
@@ -321,4 +334,11 @@ def generate_synthetic_data():
     db.close()
 
 if __name__ == "__main__":
-    generate_synthetic_data()
+    parser = argparse.ArgumentParser(description="ACADIA Demonstration Data Seeder")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Explicit confirmation flag to wipe and rebuild database tables"
+    )
+    args = parser.parse_args()
+    generate_synthetic_data(force_reset=args.reset)

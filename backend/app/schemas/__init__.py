@@ -102,7 +102,7 @@ class StudentResponse(BaseModel):
     id: str
     institution_id: str
     name: str
-    apaar_id: Optional[str] = None
+    # Raw apaar_id omitted to prevent PII exposure across standard responses
     apaar_masked: Optional[str] = None
     programme: str
     academic_year: str

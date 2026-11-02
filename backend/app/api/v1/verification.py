@@ -13,7 +13,7 @@ router = APIRouter(prefix="/verification", tags=["Verification"])
 
 @router.get("/duplicates")
 def get_duplicates(
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     """Retrieves all duplicate flagged students across or within institutions."""
@@ -43,13 +43,18 @@ def get_duplicates(
 def check_single_apaar_duplicates(
     apaar_id: str = Query(...),
     institution_id: Optional[str] = Query(None),
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
-    inst_id = institution_id or current_user.institution_id or ""
+    inst_id = institution_id
+    if current_user.role == UserRole.INSTITUTION_ADMIN.value:
+        inst_id = current_user.institution_id
+    inst_id = inst_id or ""
+    
     matches = duplicate_engine.check_cross_institution_duplicates(db, apaar_id=apaar_id, current_institution_id=inst_id)
+    masked = (apaar_id[:2] + "XXXXXXXX" + apaar_id[-2:]) if len(apaar_id) == 12 else "INVALID"
     return {
-        "apaar_masked": s_masked if 's_masked' in locals() else (apaar_id[:2] + "XXXXXXXX" + apaar_id[-2:] if len(apaar_id)==12 else "INVALID"),
+        "apaar_masked": masked,
         "match_count": len(matches),
         "matches": matches
     }
@@ -58,7 +63,7 @@ def check_single_apaar_duplicates(
 def get_intake_alerts(
     institution_id: Optional[str] = None,
     academic_year: Optional[str] = None,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     """Calculates intake discrepancies and capacity violations."""
@@ -83,6 +88,12 @@ def get_intake_alerts(
             academic_year=intake.academic_year
         )
         if report.get("alerts"):
-            alerts.append(report)
+            alerts.extend(report["alerts"])
             
-    return {"total_violations": len(alerts), "details": alerts}
+    return {
+        "institution_filter": target_inst or "ALL",
+        "academic_year_filter": academic_year or "ALL",
+        "total_alerts": len(alerts),
+        "total_violations": len(alerts),
+        "alerts": alerts
+    }

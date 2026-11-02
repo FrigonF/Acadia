@@ -1,11 +1,59 @@
-"""Security utilities: password hashing (direct bcrypt), JWT tokens, and keyed HMAC-SHA256 fingerprinting."""
+"""Security utilities: password hashing (direct bcrypt), JWT tokens, field encryption, and HMAC-SHA256 fingerprinting."""
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Any
 import hashlib
 import hmac
+import os
+import base64
 import bcrypt
 from jose import jwt
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from backend.app.core.config import settings
+
+# In-memory derived AES-GCM cipher for field-level encryption at rest
+_CIPHER: Optional[AESGCM] = None
+
+def _get_aesgcm() -> AESGCM:
+    global _CIPHER
+    if _CIPHER is not None:
+        return _CIPHER
+    
+    # Obtain or derive a 256-bit key
+    if settings.FIELD_ENCRYPTION_KEY and len(settings.FIELD_ENCRYPTION_KEY) == 64:
+        key_bytes = bytes.fromhex(settings.FIELD_ENCRYPTION_KEY)
+    else:
+        # Fallback to key derived from HMAC_SECRET_KEY in non-prod
+        key_bytes = hashlib.sha256(settings.HMAC_SECRET_KEY.encode('utf-8')).digest()
+        
+    _CIPHER = AESGCM(key_bytes)
+    return _CIPHER
+
+def encrypt_identifier(plain_id: Optional[str]) -> Optional[str]:
+    """Encrypts an identifier (such as raw APAAR ID) using authenticated AES-256-GCM.
+    Returns Base64 encoded (nonce + ciphertext + tag).
+    """
+    if not plain_id:
+        return None
+    nonce = os.urandom(12)  # Standard 96-bit nonce for AES-GCM
+    data = plain_id.strip().encode('utf-8')
+    ciphertext = _get_aesgcm().encrypt(nonce, data, None)
+    return base64.b64encode(nonce + ciphertext).decode('utf-8')
+
+def decrypt_identifier(encrypted_id: Optional[str]) -> Optional[str]:
+    """Decrypts an AES-256-GCM encrypted identifier string."""
+    if not encrypted_id:
+        return None
+    try:
+        raw_bytes = base64.b64decode(encrypted_id.encode('utf-8'))
+        if len(raw_bytes) < 12:
+            return None
+        nonce = raw_bytes[:12]
+        ciphertext = raw_bytes[12:]
+        decrypted = _get_aesgcm().decrypt(nonce, ciphertext, None)
+        return decrypted.decode('utf-8')
+    except Exception:
+        # Return None or unencrypted fallback if legacy record was plain
+        return None
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     try:

@@ -101,12 +101,15 @@ def seal_record(
 @router.get("/{record_id}")
 def get_record_versions(
     record_id: str,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     student = db.query(Student).filter(Student.id == record_id).first()
     if not student:
         raise HTTPException(status_code=404, detail="Student record not found")
+        
+    if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id != student.institution_id:
+        raise HTTPException(status_code=403, detail="Access denied to other institution's record versions.")
         
     versions = db.query(RecordVersion).filter(
         RecordVersion.student_id == record_id
@@ -133,9 +136,16 @@ def get_record_versions(
 def verify_record_integrity(
     record_id: str,
     version_number: int = None,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
+    student = db.query(Student).filter(Student.id == record_id).first()
+    if not student:
+        raise HTTPException(status_code=404, detail="Student record not found")
+        
+    if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id != student.institution_id:
+        raise HTTPException(status_code=403, detail="Access denied to other institution's record integrity verification.")
+
     query = db.query(RecordVersion).filter(RecordVersion.student_id == record_id)
     if version_number:
         query = query.filter(RecordVersion.version_number == version_number)
@@ -150,16 +160,48 @@ def verify_record_integrity(
     canonical_str = create_canonical_json(version.canonical_payload)
     fingerprint_valid = verify_record_fingerprint(canonical_str, version.fingerprint)
 
-    # 2. Verify Ed25519 digital signature
+    # 2. Verify Ed25519 digital signature against trusted key registry
     signature_valid = signature_service.verify_signature(
         fingerprint=version.fingerprint,
         signature_b64=version.signature,
+        key_id=version.key_id,
         public_key_pem=version.public_key
     )
 
-    is_completely_valid = fingerprint_valid and signature_valid
+    # 3. Verify cryptographic hash chain back to genesis if previous versions exist
+    chain_valid = True
+    if version.version_number > 1:
+        curr = version
+        while curr and curr.version_number > 1:
+            prev = db.query(RecordVersion).filter(
+                RecordVersion.student_id == record_id,
+                RecordVersion.version_number == curr.version_number - 1
+            ).first()
+            if not prev or curr.previous_fingerprint != prev.fingerprint:
+                chain_valid = False
+                break
+            # Also verify previous version's signature
+            prev_sig_ok = signature_service.verify_signature(
+                fingerprint=prev.fingerprint,
+                signature_b64=prev.signature,
+                key_id=prev.key_id,
+                public_key_pem=prev.public_key
+            )
+            if not prev_sig_ok:
+                chain_valid = False
+                break
+            curr = prev
+
+    is_completely_valid = fingerprint_valid and signature_valid and chain_valid
     status_str = "INTEGRITY_VERIFIED" if is_completely_valid else "TAMPERING_DETECTED"
-    msg = "Record canonical hash and digital signature match perfectly." if is_completely_valid else "Cryptographic hash mismatch or signature verification failure."
+    if not chain_valid:
+        msg = "Cryptographic hash chain broken or previous version signature invalidated."
+    elif not signature_valid:
+        msg = "Ed25519 digital signature invalid or key untrusted."
+    elif not fingerprint_valid:
+        msg = "SHA-256 fingerprint canonical payload mismatch."
+    else:
+        msg = "Record canonical hash, signature and full version chain verified successfully."
 
     return VerifyIntegrityResponse(
         record_id=record_id,

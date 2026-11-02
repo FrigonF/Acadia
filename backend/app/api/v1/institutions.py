@@ -19,7 +19,7 @@ def list_institutions(
     skip: int = 0,
     limit: int = 100,
     status_filter: Optional[str] = None,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     query = db.query(Institution)
@@ -61,7 +61,11 @@ def create_institution(
     return inst
 
 @router.get("/{id}", response_model=InstitutionResponse)
-def get_institution(id: str, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_institution(
+    id: str,
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
+    db: Session = Depends(get_db)
+):
     if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id != id:
         raise HTTPException(status_code=403, detail="Access denied to other institutions.")
         
@@ -151,7 +155,11 @@ def set_approved_intake(
     return intake_obj
 
 @router.get("/{id}/intake", response_model=List[IntakeResponse])
-def get_institution_intakes(id: str, current_user = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_institution_intakes(
+    id: str,
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
+    db: Session = Depends(get_db)
+):
     if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id != id:
         raise HTTPException(status_code=403, detail="Access denied.")
     return db.query(ApprovedIntake).filter(ApprovedIntake.institution_id == id).all()

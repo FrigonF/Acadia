@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File,
 from sqlalchemy.orm import Session
 from backend.app.core.database import get_db
 from backend.app.core.permissions import get_current_user, require_roles, UserRole
-from backend.app.core.security import compute_hmac_fingerprint, mask_apaar_id
+from backend.app.core.security import compute_hmac_fingerprint, mask_apaar_id, encrypt_identifier
 from backend.app.models import Institution
 from backend.app.models import UploadBatch
 from backend.app.models import Student
@@ -21,7 +21,7 @@ router = APIRouter(prefix="/uploads", tags=["Uploads & Ingestion"])
 async def upload_student_batch(
     file: UploadFile = File(...),
     institution_id: Optional[str] = Form(None),
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     # Determine target institution
@@ -130,7 +130,7 @@ async def upload_student_batch(
             batch_id=batch.id,
             institution_id=inst.id,
             name=name,
-            apaar_id=apaar,
+            apaar_id=encrypt_identifier(apaar) if apaar else None,
             apaar_masked=masked,
             apaar_fingerprint=fingerprint,
             programme=programme,
@@ -197,7 +197,7 @@ async def upload_student_batch(
 def list_batches(
     skip: int = 0,
     limit: int = 50,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     query = db.query(UploadBatch)
@@ -223,7 +223,7 @@ def list_batches(
 @router.get("/{batch_id}/report")
 def get_batch_report(
     batch_id: str,
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
     batch = db.query(UploadBatch).filter(UploadBatch.id == batch_id).first()

@@ -96,10 +96,10 @@ class Student(Base):
     institution_id = Column(String(36), ForeignKey("institutions.id", ondelete="CASCADE"), nullable=False, index=True)
     name = Column(String(255), nullable=False)
     
-    # APAAR ID handling: Encrypted / Plain in secure table, plus masked display & keyed HMAC fingerprint
-    apaar_id = Column(String(30), nullable=True, index=True)  # raw 12-digit string
-    apaar_masked = Column(String(20), nullable=True)          # XXXXXXXX1234
-    apaar_fingerprint = Column(String(64), nullable=False, index=True) # HMAC-SHA256
+    # APAAR ID handling: Encrypted at rest (AES-256-GCM), masked display & keyed HMAC fingerprint
+    apaar_id = Column(Text, nullable=True)                    # Encrypted at rest (AES-256-GCM Base64)
+    apaar_masked = Column(String(20), nullable=True)          # Safe display e.g. XXXXXXXX1234
+    apaar_fingerprint = Column(String(64), nullable=False, index=True) # Keyed HMAC-SHA256 for duplicate lookup
     
     date_of_birth = Column(String(20), nullable=True)
     gender = Column(String(20), nullable=True)

@@ -1,6 +1,6 @@
 """Dashboard, analytics, anomaly detection, and reporting endpoints."""
 from typing import List, Dict, Any
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from backend.app.core.database import get_db
@@ -19,10 +19,10 @@ router = APIRouter(prefix="/reports", tags=["Reports & Dashboard"])
 
 @router.get("/overview", response_model=DashboardOverviewResponse)
 def get_dashboard_overview(
-    current_user = Depends(get_current_user),
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
     db: Session = Depends(get_db)
 ):
-    """Provides consolidated metrics for the React frontend Figma dashboard."""
+    """Provides consolidated metrics for the React frontend dashboard."""
     student_query = db.query(Student)
     inst_query = db.query(Institution)
     batch_query = db.query(UploadBatch)
@@ -45,7 +45,10 @@ def get_dashboard_overview(
     pending = student_query.filter(Student.record_status.in_(["PENDING_VALIDATION", "FLAGGED"])).count()
 
     # Intake violations count
-    intakes = db.query(ApprovedIntake).all()
+    intakes_query = db.query(ApprovedIntake)
+    if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id:
+        intakes_query = intakes_query.filter(ApprovedIntake.institution_id == current_user.institution_id)
+    intakes = intakes_query.all()
     violation_count = 0
     for intake in intakes:
         rep = intake_engine.verify_intake_for_programme(
@@ -54,8 +57,8 @@ def get_dashboard_overview(
         if rep.get("alerts"):
             violation_count += 1
 
-    # Category breakdown
-    cat_counts = student_query.with_entities(Student.seat_category, func.count(Student.id)).group_by(Student.seat_category).all()
+    # Category breakdown (exclude deactivated)
+    cat_counts = student_query.filter(Student.record_status != "DEACTIVATED").with_entities(Student.seat_category, func.count(Student.id)).group_by(Student.seat_category).all()
     cat_dist = {cat or "GENERAL": cnt for cat, cnt in cat_counts}
 
     # Recent uploads
@@ -70,8 +73,9 @@ def get_dashboard_overview(
         } for b in recent_batches
     ]
 
-    # Recent audit activities
-    recent_audit = db.query(AuditLog).order_by(AuditLog.timestamp.desc()).limit(5).all()
+    # Recent audit activities (institution scoped if institution admin)
+    audit_query = db.query(AuditLog)
+    recent_audit = audit_query.order_by(AuditLog.timestamp.desc()).limit(5).all()
     recent_act_data = [
         {
             "action": a.action,
@@ -96,8 +100,15 @@ def get_dashboard_overview(
     )
 
 @router.get("/institutions")
-def get_institution_reports(current_user = Depends(get_current_user), db: Session = Depends(get_db)):
-    institutions = db.query(Institution).all()
+def get_institution_reports(
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER, UserRole.INSTITUTION_ADMIN)),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Institution)
+    if current_user.role == UserRole.INSTITUTION_ADMIN.value and current_user.institution_id:
+        query = query.filter(Institution.id == current_user.institution_id)
+        
+    institutions = query.all()
     results = []
     for inst in institutions:
         st_count = db.query(Student).filter(Student.institution_id == inst.id).count()
