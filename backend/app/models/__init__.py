@@ -210,3 +210,7 @@ class AuditLog(Base):
     event_metadata = Column(JSON, default=dict)
     ip_address = Column(String(45), nullable=True)
     timestamp = Column(DateTime, default=utc_now, index=True)
+    
+    # Tamper-evident cryptographic hash chain fields
+    entry_hash = Column(String(64), nullable=True, index=True)        # SHA-256 of canonical entry content + previous_hash
+    previous_entry_hash = Column(String(64), nullable=True)           # Hash of previous audit entry

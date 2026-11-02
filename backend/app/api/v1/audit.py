@@ -29,6 +29,16 @@ def list_audit_logs(
         
     return query.order_by(AuditLog.timestamp.desc()).offset(skip).limit(limit).all()
 
+@router.get("/verify-chain/integrity")
+def verify_audit_chain(
+    limit: int = 100,
+    current_user = Depends(require_roles(UserRole.PLATFORM_ADMIN, UserRole.AICTE_VERIFIER)),
+    db: Session = Depends(get_db)
+):
+    """Cryptographically verifies the SHA-256 hash chain of the audit trail to detect tampering or record deletion."""
+    from backend.app.services.reporting.audit_service import verify_audit_trail_integrity
+    return verify_audit_trail_integrity(db, limit=limit)
+
 @router.get("/{record_id}", response_model=List[AuditLogResponse])
 def get_record_audit_history(
     record_id: str,

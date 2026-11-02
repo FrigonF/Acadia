@@ -7,64 +7,102 @@
 
 ## 1. Project Overview & Architecture
 
-ACADIA is a full-stack platform consisting of:
-- **Backend**: Python 3.12, FastAPI, SQLAlchemy 2 ORM, Pydantic v2, SQLite/PostgreSQL, Ed25519 Cryptographic Signatures, Keyed HMAC-SHA256 privacy duplicate detection, scikit-learn Isolation Forest anomaly alerts.
-- **Frontend**: React 19, Tailwind CSS v4, Vite 8, TypeScript. Integrates with the backend REST API.
+ACADIA is an enterprise academic registry platform providing end-to-end student lifecycle management, cryptographically sealed record versioning, and privacy-preserving duplicate detection.
+
+- **Backend Architecture**: Python 3.12, FastAPI, SQLAlchemy 2 ORM, Pydantic v2, Ed25519 Asymmetric Digital Signatures, Keyed HMAC-SHA256 privacy-preserving duplicate detection, AES-256-GCM field-level encryption at rest, and scikit-learn Isolation Forest anomaly alerts.
+- **Frontend Architecture**: React 19, Tailwind CSS v4, Vite 8, TypeScript. Connects to backend REST APIs.
+- **Live APAAR/DigiLocker Integration Notice**: In compliance with national data privacy standards and Ministry guidelines, live DigiLocker/APAAR API connectivity requires official governmental approval and bilateral credentials. The prototype implements a high-fidelity **Mock APAAR Adapter** with identical payloads, response schemas, and latency simulation.
 
 ---
 
-## 2. Quickstart Instructions (Windows & Linux)
+## 2. Quickstart Instructions (Instant Local Run)
 
-### Terminal 1: Backend Setup & Execution
+### One-Click Launch (Windows)
+Double-click `run.bat` in the project root:
+- Runs non-destructive database verification / initial seed.
+- Launches FastAPI backend on `http://localhost:8000`.
+- Launches Vite React frontend on `http://localhost:5173`.
+- Automatically opens the browser.
+
+---
+
+### Manual Setup & Execution
+
+#### Terminal 1: Backend Setup
 ```powershell
-# 1. Install backend dependencies
+# 1. Install dependencies
 python -m pip install -r requirements.txt
 
-# 2. Seed database with synthetic demonstration data (5 institutions, users, intakes, 510+ students)
+# 2. Seed demonstration database (Safe & non-destructive by default)
 python -m backend.scripts.generate_synthetic_data
 
-# 3. Run backend test suite (All 8 tests passing)
-python -m pytest backend/tests/test_acadia_core.py -v
+# 3. Run complete automated regression test suite (30 passed)
+python -m pytest backend/tests -v
 
-# 4. Start the FastAPI backend server
+# 4. Start backend API server
 uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
-Swagger UI docs: `http://localhost:8000/docs`
+- API Documentation (Swagger UI): `http://localhost:8000/docs`
 
----
-
-### Terminal 2: Frontend Setup & Execution
+#### Terminal 2: Frontend Setup
 ```powershell
-# 1. Navigate to Frontend folder and install dependencies
 cd Frontend
 pnpm install
-
-# 2. Start the Vite development server
 pnpm dev
 ```
-Open your browser at: `http://localhost:5173`
+- Web Application: `http://localhost:5173`
 
 ---
 
-## 3. Pre-configured Demo Login Roles
+## 3. Pre-configured Demonstration Accounts
 
 | Role | Email | Password | Permissions Scope |
 | :--- | :--- | :--- | :--- |
-| **Platform Administrator** | `admin@acadia.gov.in` | `Admin@Acadia2026` | Full platform access, audits, institutions |
-| **AICTE Central Verifier** | `verifier@aicte.gov.in` | `Verifier@Aicte2026` | Intake violations, record sealing, anomaly review |
-| **Institution Admin (Delhi)** | `admin@diaet.edu.in` | `Delhi@Inst2026` | Delhi Institute data intake, student records |
-| **Institution Admin (Pune)** | `admin@mitr.ac.in` | `Pune@Inst2026` | Pune Institute data intake, student records |
-| **External Verifier** | `verifier@external-corp.com` | `Verify@External2026` | QR credential inspection |
+| **Platform Administrator** | `admin@acadia.gov.in` | `Admin@Acadia2026` | Full platform access, audit trail verification, institution management |
+| **AICTE Central Verifier** | `verifier@aicte.gov.in` | `Verifier@Aicte2026` | Review intake alerts, approve records, cryptographic sealing |
+| **Institution Admin (Delhi)** | `admin@diaet.edu.in` | `Delhi@Inst2026` | Delhi Institute data intake, student record modifications |
+| **Institution Admin (Pune)** | `admin@mitr.ac.in` | `Pune@Inst2026` | Pune Institute data intake, student record modifications |
+| **External Verifier** | `verifier@external-corp.com` | `Verify@External2026` | Restricted strictly to public QR verification (`/api/v1/qr/verify/{token}`) |
 
 ---
 
-## 4. End-to-End Workflow & Features Implemented
+## 4. Cryptographic Security & Privacy Architecture
 
-1. **Authentication & RBAC**: JWT Bearer token authentication with role-based routing and tenant isolation.
-2. **Overview Dashboard**: Live statistics (total students, validated, duplicates, intake alerts) and interactive capacity chart.
-3. **Institution Directory**: Real-time listing with AISHE codes, approved programmes, and CSV export.
-4. **Student Directory**: Student records with privacy-preserving masked APAAR IDs (`XXXXXXXX9012`).
-5. **Data Intake**: Drag-and-drop file ingestion supporting both `.csv` and `.xlsx` with format validation.
-6. **Verification Queue**: Triage duplicate registrations, intake capacity breaches, and row-level issues with resolution notes.
-7. **Record Integrity**: Canonical JSON hashing, Ed25519 digital signing, tamper detection, QR generation and public QR verification.
-8. **Reports & Audit**: Centralized immutable audit logs capturing actors, timestamps, and action types.
+1. **Secret & Key Management**:
+   - Environment-driven configuration via `.env` (derived from `.env.example`).
+   - Production validation enforces fail-safe exit if weak or legacy default development keys are detected.
+2. **Ed25519 Digital Signatures**:
+   - Every sealed version carries an asymmetric Ed25519 signature of the canonical SHA-256 hash.
+   - Verified strictly against a trusted in-memory public key registry (`TRUSTED_PUBLIC_KEYS`), neutralizing public-key injection attacks in database columns.
+   - Any historical compromised development keys (`acadia-dev-key-2026-v1`) are marked revoked and immediately rejected.
+3. **APAAR Privacy & AES-256-GCM Encryption**:
+   - Raw 12-digit APAAR IDs are encrypted at rest using authenticated AES-256-GCM with unique random 96-bit nonces.
+   - Raw APAAR IDs are omitted from general API responses and audit logs.
+   - Key-version tagging (`enc:v1:...`, `enc:v2:...`) supports seamless encryption key rotation and historical retention via a managed keyring.
+4. **Keyed HMAC-SHA256 Duplicate Detection**:
+   - Uses a secret salt to compute irreversible hashes, preventing cross-institution dual enrollment without exposing plaintext IDs.
+   - Migration utility (`migrate_student_identifiers`) supports zero-knowledge re-fingerprinting when rotating HMAC keys.
+5. **Tamper-Evident Audit Trail**:
+   - Audit entries are cryptographically chained using SHA-256 hash digests (`entry_hash = SHA256(content + previous_entry_hash)`).
+   - Tampering or deletion of audit records is instantly detected via `/api/v1/audit/verify-chain/integrity`.
+
+---
+
+## 5. Automated Test Suite
+
+Run the full automated test suite covering all 30 test scenarios:
+```powershell
+python -m pytest backend/tests -v
+```
+Test categories covered:
+- Core E2E API workflows (`test_acadia_core.py`)
+- Full student CRUD lifecycle & cryptographic integrity (`test_qa_lifecycle.py`)
+- Role-based access control and tenant isolation (`test_qa_rbac.py`)
+- Security remediation & APAAR privacy (`test_remediation_regression.py`)
+- Key rotation, AES keyring, HMAC migration & audit hash chain (`test_key_rotation.py`)
+
+---
+
+## 6. Known Prototype Boundaries
+- **DigiLocker Integration**: Real-world integration with DigiLocker and APAAR requires formal institutional empanelment and government API gateway tokens. ACADIA uses a compliant mock adapter.
+- **Hardware Security Modules (HSM)**: In production deployments, Ed25519 private keys should be stored in cloud KMS or dedicated HSMs rather than filesystem environment variables.

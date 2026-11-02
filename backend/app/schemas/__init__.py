@@ -195,6 +195,8 @@ class AuditLogResponse(BaseModel):
     target_type: str
     target_id: Optional[str] = None
     event_metadata: Dict[str, Any]
+    entry_hash: Optional[str] = None
+    previous_entry_hash: Optional[str] = None
     timestamp: datetime
     
     model_config = {"from_attributes": True}

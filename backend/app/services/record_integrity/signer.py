@@ -1,6 +1,6 @@
-"""Ed25519 asymmetric digital signature and verification service with key registry management."""
+"""Ed25519 asymmetric digital signature and verification service with key registry and revocation management."""
 import base64
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, List
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 from backend.app.core.config import settings
@@ -23,6 +23,9 @@ class DigitalSignatureService:
         self._trusted_keys: Dict[str, str] = dict(settings.TRUSTED_PUBLIC_KEYS or {})
         # Always register the current active public key in the trusted set
         self._trusted_keys[self.key_id] = self.get_public_key_pem()
+        
+        # Revoked keys list
+        self._revoked_keys: set = set(settings.REVOKED_KEY_IDS or [])
 
     def get_public_key_pem(self) -> str:
         """Returns public key in standard OpenSSL PEM format."""
@@ -35,6 +38,16 @@ class DigitalSignatureService:
     def register_trusted_key(self, key_id: str, public_key_pem: str):
         """Allows registering a known historical or external root public key."""
         self._trusted_keys[key_id] = public_key_pem
+
+    def revoke_key(self, key_id: str):
+        """Mark a key as revoked."""
+        self._revoked_keys.add(key_id)
+
+    def is_key_revoked(self, key_id: str) -> bool:
+        return key_id in self._revoked_keys
+
+    def is_key_trusted(self, key_id: str) -> bool:
+        return (key_id in self._trusted_keys) and (key_id not in self._revoked_keys)
 
     def sign_fingerprint(self, fingerprint: str) -> str:
         """Signs a SHA-256 fingerprint hex string using Ed25519.
@@ -53,17 +66,22 @@ class DigitalSignatureService:
     ) -> bool:
         """Cryptographically verifies that the signature corresponds to the fingerprint.
         
-        SECURITY REMEDIATION:
-        Never trusts arbitrary public keys supplied by untrusted callers or unverified DB rows.
-        Verifies against the platform's trusted public keys registry for that key_id.
+        Enforces:
+        1. Explicitly checks against revoked key IDs (e.g. compromised dev key).
+        2. Never trusts arbitrary public keys stored in mutable database rows.
+        3. Must be present in the trusted public key registry.
         """
         try:
+            # 1. Reject if key is marked as revoked
+            if key_id and self.is_key_revoked(key_id):
+                return False
+
             signature_bytes = base64.b64decode(signature_b64)
             data = fingerprint.encode('utf-8')
             
             # Determine the trusted public key to use
             trusted_pem = None
-            if key_id and key_id in self._trusted_keys:
+            if key_id and self.is_key_trusted(key_id):
                 trusted_pem = self._trusted_keys[key_id]
             elif public_key_pem and not key_id:
                 # If no key_id provided, only allow if the PEM matches our current active key

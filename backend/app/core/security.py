@@ -1,6 +1,6 @@
-"""Security utilities: password hashing (direct bcrypt), JWT tokens, field encryption, and HMAC-SHA256 fingerprinting."""
+"""Security utilities: password hashing (direct bcrypt), JWT tokens, field encryption with key ring, and HMAC-SHA256 fingerprinting."""
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Any
+from typing import Optional, Any, Dict
 import hashlib
 import hmac
 import os
@@ -10,49 +10,83 @@ from jose import jwt
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from backend.app.core.config import settings
 
-# In-memory derived AES-GCM cipher for field-level encryption at rest
-_CIPHER: Optional[AESGCM] = None
+# In-memory dictionary of key_version -> AESGCM cipher
+_CIPHERS: Dict[str, AESGCM] = {}
 
-def _get_aesgcm() -> AESGCM:
-    global _CIPHER
-    if _CIPHER is not None:
-        return _CIPHER
+def _init_ciphers():
+    global _CIPHERS
+    _CIPHERS.clear()
     
-    # Obtain or derive a 256-bit key
+    # 1. Primary active key from settings.FIELD_ENCRYPTION_KEY
     if settings.FIELD_ENCRYPTION_KEY and len(settings.FIELD_ENCRYPTION_KEY) == 64:
         key_bytes = bytes.fromhex(settings.FIELD_ENCRYPTION_KEY)
     else:
-        # Fallback to key derived from HMAC_SECRET_KEY in non-prod
         key_bytes = hashlib.sha256(settings.HMAC_SECRET_KEY.encode('utf-8')).digest()
         
-    _CIPHER = AESGCM(key_bytes)
-    return _CIPHER
+    active_ver = settings.ACTIVE_KEY_VERSION or "v1"
+    _CIPHERS[active_ver] = AESGCM(key_bytes)
+    
+    # 2. Additional historical keys in settings.FIELD_KEYRING (e.g. {"v1": "hex...", "v2": "hex..."})
+    if settings.FIELD_KEYRING:
+        for ver, hex_key in settings.FIELD_KEYRING.items():
+            if hex_key and len(hex_key) == 64:
+                _CIPHERS[ver] = AESGCM(bytes.fromhex(hex_key))
 
-def encrypt_identifier(plain_id: Optional[str]) -> Optional[str]:
-    """Encrypts an identifier (such as raw APAAR ID) using authenticated AES-256-GCM.
-    Returns Base64 encoded (nonce + ciphertext + tag).
+def get_cipher(version: Optional[str] = None) -> AESGCM:
+    if not _CIPHERS:
+        _init_ciphers()
+    ver = version or settings.ACTIVE_KEY_VERSION or "v1"
+    if ver in _CIPHERS:
+        return _CIPHERS[ver]
+    # Fallback to active cipher
+    return _CIPHERS[settings.ACTIVE_KEY_VERSION or "v1"]
+
+def register_field_key(version: str, hex_key: str):
+    """Dynamically register a historical or rotated key into the active keyring."""
+    global _CIPHERS
+    if len(hex_key) == 64:
+        _CIPHERS[version] = AESGCM(bytes.fromhex(hex_key))
+
+def encrypt_identifier(plain_id: Optional[str], key_version: Optional[str] = None) -> Optional[str]:
+    """Encrypts an identifier using authenticated AES-256-GCM.
+    Formats ciphertext with explicit key version header:
+    e.g. "enc:v1:<base64(nonce + ciphertext + tag)>"
     """
     if not plain_id:
         return None
+    ver = key_version or settings.ACTIVE_KEY_VERSION or "v1"
+    cipher = get_cipher(ver)
     nonce = os.urandom(12)  # Standard 96-bit nonce for AES-GCM
     data = plain_id.strip().encode('utf-8')
-    ciphertext = _get_aesgcm().encrypt(nonce, data, None)
-    return base64.b64encode(nonce + ciphertext).decode('utf-8')
+    ciphertext = cipher.encrypt(nonce, data, None)
+    b64_payload = base64.b64encode(nonce + ciphertext).decode('utf-8')
+    return f"enc:{ver}:{b64_payload}"
 
 def decrypt_identifier(encrypted_id: Optional[str]) -> Optional[str]:
-    """Decrypts an AES-256-GCM encrypted identifier string."""
+    """Decrypts an AES-256-GCM encrypted identifier string with version identification."""
     if not encrypted_id:
         return None
     try:
-        raw_bytes = base64.b64decode(encrypted_id.encode('utf-8'))
+        raw_str = encrypted_id.strip()
+        version = None
+        b64_data = raw_str
+
+        # Check versioned prefix e.g. "enc:v1:..."
+        if raw_str.startswith("enc:"):
+            parts = raw_str.split(":", 2)
+            if len(parts) == 3:
+                version = parts[1]
+                b64_data = parts[2]
+
+        cipher = get_cipher(version)
+        raw_bytes = base64.b64decode(b64_data.encode('utf-8'))
         if len(raw_bytes) < 12:
             return None
         nonce = raw_bytes[:12]
         ciphertext = raw_bytes[12:]
-        decrypted = _get_aesgcm().decrypt(nonce, ciphertext, None)
+        decrypted = cipher.decrypt(nonce, ciphertext, None)
         return decrypted.decode('utf-8')
     except Exception:
-        # Return None or unencrypted fallback if legacy record was plain
         return None
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -62,7 +96,6 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 def get_password_hash(password: str) -> str:
-    # Truncate to 72 bytes if necessary to adhere strictly to bcrypt spec
     pwd_bytes = password.encode('utf-8')[:72]
     salt = bcrypt.gensalt()
     return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
@@ -84,15 +117,16 @@ def decode_access_token(token: str) -> Optional[dict]:
     except Exception:
         return None
 
-def compute_hmac_fingerprint(identifier: str) -> str:
+def compute_hmac_fingerprint(identifier: str, secret_key: Optional[str] = None) -> str:
     """Compute keyed HMAC-SHA256 fingerprint of identifier for cross-institution duplicate detection.
     
     Protects privacy: Predictable 12-digit identifiers cannot be reversed or dictionary-attacked
     without the server-side HMAC secret key.
     """
     cleaned = str(identifier).strip()
+    key = (secret_key or settings.HMAC_SECRET_KEY).encode("utf-8")
     return hmac.new(
-        settings.HMAC_SECRET_KEY.encode("utf-8"),
+        key,
         cleaned.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
