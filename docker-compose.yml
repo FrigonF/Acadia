@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: acadia_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: acadia
+      POSTGRES_PASSWORD: acadia_password
+      POSTGRES_DB: acadia_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: acadia_backend
+    restart: always
+    environment:
+      DATABASE_URL: postgresql://acadia:acadia_password@db:5432/acadia_db
+      SECRET_KEY: acadia_prod_secret_key_sih2026
+      HMAC_SECRET_KEY: acadia_hmac_secret_key_sih2026
+      ED25519_PRIVATE_KEY_HEX: 4a5c6d7e8f901234567890abcdef1234567890abcdef1234567890abcdef1234
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+volumes:
+  postgres_data:
