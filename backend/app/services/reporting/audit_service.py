@@ -1,10 +1,14 @@
-"""Tamper-evident Audit Logger Utility with Cryptographic Hash Chaining."""
-from typing import Optional, Dict, Any
+"""Tamper-evident Audit Logger Utility with Cryptographic Hash Chaining and External Signed Checkpoints."""
+from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from sqlalchemy.orm import Session
 from backend.app.models import AuditLog
+from backend.app.services.record_integrity.signer import signature_service
+
+CHECKPOINT_LOG_FILE = "backend/data/audit_checkpoints.jsonl"
 
 def _compute_audit_hash(
     actor_email: Optional[str],
@@ -84,8 +88,110 @@ def log_audit_event(
     db.commit()
     return audit_entry
 
+def create_external_audit_checkpoint(db: Session, checkpoint_path: str = CHECKPOINT_LOG_FILE) -> Dict[str, Any]:
+    """Generates an externally stored, cryptographically signed checkpoint of the current audit trail tip.
+    
+    Defends against:
+    - Truncation attacks (deleting recent audit records from the tail of the table).
+    - Complete database replacement or rollback to an earlier snapshot.
+    """
+    last_entry = db.query(AuditLog).order_by(AuditLog.timestamp.desc(), AuditLog.id.desc()).first()
+    if not last_entry:
+        return {"status": "EMPTY", "message": "No audit entries to checkpoint."}
+
+    total_count = db.query(AuditLog).count()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    
+    checkpoint_payload = {
+        "tip_audit_id": last_entry.id,
+        "tip_entry_hash": last_entry.entry_hash,
+        "tip_timestamp": last_entry.timestamp.isoformat(),
+        "total_audit_count": total_count,
+        "checkpoint_created_at": now_iso
+    }
+    canonical_checkpoint = json.dumps(checkpoint_payload, sort_keys=True, separators=(',', ':'))
+    signature = signature_service.sign_fingerprint(
+        hashlib.sha256(canonical_checkpoint.encode('utf-8')).hexdigest()
+    )
+
+    checkpoint_record = {
+        **checkpoint_payload,
+        "key_id": signature_service.key_id,
+        "signature": signature
+    }
+
+    # Append to external checkpoint file
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+    with open(checkpoint_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(checkpoint_record) + "\n")
+
+    return {
+        "status": "CHECKPOINT_CREATED",
+        "checkpoint": checkpoint_record
+    }
+
+def verify_audit_against_checkpoints(db: Session, checkpoint_path: str = CHECKPOINT_LOG_FILE) -> Dict[str, Any]:
+    """Verifies that all historically signed external checkpoints still exist in the database in exact sequence.
+    Detects if the database was rolled back, replaced, or had records deleted from the tail.
+    """
+    if not os.path.exists(checkpoint_path):
+        return {"status": "NO_CHECKPOINTS", "message": "No external checkpoints file found."}
+
+    checkpoints: List[Dict[str, Any]] = []
+    with open(checkpoint_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if line.strip():
+                try:
+                    checkpoints.append(json.loads(line.strip()))
+                except Exception:
+                    continue
+
+    if not checkpoints:
+        return {"status": "NO_CHECKPOINTS", "message": "Checkpoints file was empty."}
+
+    for idx, cp in enumerate(checkpoints):
+        # 1. Verify digital signature of the external checkpoint itself
+        cp_copy = dict(cp)
+        sig = cp_copy.pop("signature", None)
+        key_id = cp_copy.pop("key_id", None)
+        canonical = json.dumps(cp_copy, sort_keys=True, separators=(',', ':'))
+        cp_hash = hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+        
+        if not signature_service.verify_signature(fingerprint=cp_hash, signature_b64=sig, key_id=key_id):
+            return {
+                "status": "CHECKPOINT_SIGNATURE_INVALID",
+                "checkpoint_index": idx,
+                "tip_audit_id": cp.get("tip_audit_id"),
+                "error": "External checkpoint digital signature failed verification against trusted registry."
+            }
+
+        # 2. Verify that the checkpointed audit entry still exists in the database
+        db_entry = db.query(AuditLog).filter(AuditLog.id == cp["tip_audit_id"]).first()
+        if not db_entry:
+            return {
+                "status": "TAMPER_DELETION_DETECTED",
+                "checkpoint_index": idx,
+                "missing_audit_id": cp["tip_audit_id"],
+                "error": f"Database has been truncated or rolled back: Checkpointed entry {cp['tip_audit_id']} is missing from database."
+            }
+
+        # 3. Verify entry hash matches
+        if db_entry.entry_hash != cp["tip_entry_hash"]:
+            return {
+                "status": "TAMPER_MODIFICATION_DETECTED",
+                "checkpoint_index": idx,
+                "audit_id": cp["tip_audit_id"],
+                "error": "Checkpointed entry hash differs from database entry hash. Database substitution detected."
+            }
+
+    return {
+        "status": "CHECKPOINTS_VERIFIED",
+        "verified_checkpoints_count": len(checkpoints),
+        "tampering_detected": False
+    }
+
 def verify_audit_trail_integrity(db: Session, limit: int = 100) -> Dict[str, Any]:
-    """Verifies the mathematical hash chain of the audit trail to detect tampering or deletions."""
+    """Verifies the mathematical hash chain of the audit trail to detect internal modifications or gaps."""
     entries = db.query(AuditLog).order_by(AuditLog.timestamp.asc(), AuditLog.id.asc()).limit(limit).all()
     if not entries:
         return {"status": "EMPTY", "verified_count": 0, "chain_valid": True}
@@ -95,7 +201,6 @@ def verify_audit_trail_integrity(db: Session, limit: int = 100) -> Dict[str, Any
         if not entry.entry_hash:
             continue
         expected_prev = prev_hash
-        # Recompute expected hash
         recomputed = _compute_audit_hash(
             actor_email=entry.actor_email,
             action=entry.action,

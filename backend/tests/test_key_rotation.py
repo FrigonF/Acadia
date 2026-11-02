@@ -132,4 +132,33 @@ def test_audit_hash_chain_verification():
     report = verify_audit_trail_integrity(db, limit=50)
     assert report["chain_valid"] is True
     assert report["status"] == "CHAIN_VERIFIED"
-    db.close()
+
+    # 7. Test external signed checkpoint creation & tamper detection
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tf:
+        cp_path = tf.name
+
+    from backend.app.services.reporting.audit_service import (
+        create_external_audit_checkpoint, verify_audit_against_checkpoints
+    )
+    try:
+        cp_res = create_external_audit_checkpoint(db, checkpoint_path=cp_path)
+        assert cp_res["status"] == "CHECKPOINT_CREATED"
+        
+        # Verify checkpoint matches current db
+        ver_res = verify_audit_against_checkpoints(db, checkpoint_path=cp_path)
+        assert ver_res["status"] == "CHECKPOINTS_VERIFIED"
+        assert ver_res["tampering_detected"] is False
+
+        # Simulate truncation attack: delete the latest audit entry from DB
+        db.delete(e3)
+        db.commit()
+
+        # Checkpoints verification must immediately flag missing entry
+        trunc_res = verify_audit_against_checkpoints(db, checkpoint_path=cp_path)
+        assert trunc_res["status"] == "TAMPER_DELETION_DETECTED"
+    finally:
+        import os
+        if os.path.exists(cp_path):
+            os.remove(cp_path)
+        db.close()
